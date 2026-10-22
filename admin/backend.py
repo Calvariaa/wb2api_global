@@ -25,6 +25,7 @@ if _ROOT not in sys.path:
 
 from wb_install import WB  # noqa: E402  安装位置 / 版本号 / 风控配置自动发现
 from admin import client_profile as cprofile  # noqa: E402  客户端参数档案（可后台配置/同步）
+from admin import edition  # noqa: E402  上游版本（国内版 / 国际版）常量
 
 # ---------------------------------------------------------------------------
 # Ardot 画布（create_canvas）—— 真实 id 的解析口径
@@ -117,8 +118,14 @@ ARDOT_CANVAS_PROMPT = (
 HTTP_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
 
 #: 各域名与 UA（成长任务在不同域上报，头形状必须与对应客户端一致）
-WEB_BASE = "https://www.workbuddy.cn"      # web 域：资料库等浏览器行为
-BILL_BASE = "https://www.codebuddy.cn"     # billing 域：常规业务上报
+#:
+#: 取值来自 `admin/edition.py` 的 profile —— 国内版与国际版是两套部署，
+#: 域名全部随 `ADMIN_UPSTREAM_EDITION` 切换。**不要在别处再写死域名**：
+#: 国际版 chat/login/billing 同域（www.workbuddy.ai），一旦漏改某个常量，
+#: 表现是「登录成功但业务接口全部 404」，极难定位。
+_EDITION = edition.profile()
+WEB_BASE = _EDITION.login_base            # web 域：资料库等浏览器行为
+BILL_BASE = _EDITION.billing_base         # billing 域：常规业务上报
 WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
           "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 #: 桌面客户端版本与内嵌 CLI 版本。
@@ -817,7 +824,7 @@ class AccountSession:
         return str(self._sess_acct().get("nickname") or "")
 
     def _domain(self) -> str:
-        return self._sess_auth().get("domain") or "copilot.tencent.com"
+        return self._sess_auth().get("domain") or edition.profile().chat_base.split("//")[-1]
 
     def _billing_headers(self) -> dict:
         """billing 域头：CLI 形状。"""
@@ -1522,7 +1529,7 @@ class AccountSession:
             "Authorization": "Bearer " + (self._sess_auth().get("accessToken") or ""),
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "X-Domain": self._domain() or "www.workbuddy.cn",
+            "X-Domain": self._domain() or WEB_BASE,
             "X-Product": "SaaS",
             "X-User-Id": self._uid(),
             "User-Agent": _desktop_ua(),
@@ -1531,7 +1538,7 @@ class AccountSession:
 
     def _ardot_connector_bases(self) -> list[str]:
         """候选基址：账号业务域优先，再回落 copilot 域（与官方同序）。"""
-        domain = self._domain() or "www.workbuddy.cn"
+        domain = self._domain() or WEB_BASE
         bases = [f"https://{domain}"]
         if BACKEND not in bases:
             bases.append(BACKEND)

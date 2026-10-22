@@ -79,8 +79,22 @@ _logger = logging.getLogger("admin.wb_login")
 # ---------------------------------------------------------------------------
 
 #: 控制台/站点域。登录页、console 会话、plugin 端点都在这里。
-HOST = "https://www.workbuddy.cn"
-#: OneID（腾讯统一账号）域，短信接口在这里。
+#:
+#: 随**上游版本**变化（见 `admin/edition.py`）：国内版 www.workbuddy.cn，
+#: 国际版 www.workbuddy.ai。设备授权协议两者同构，只有域名不同。
+#: 兼容旧引用：模块级 `HOST` 保留为**当前 edition** 的值；
+#: 需要显式指定版本时用 `login_base(name)`。
+from admin import edition as _edition  # noqa: E402
+
+HOST = _edition.profile().login_base
+
+
+def login_base(name: str | None = None) -> str:
+    """取某个版本（默认当前 edition）的登录/站点域。"""
+    return _edition.profile(name).login_base
+
+
+#: OneID（腾讯统一账号）域，短信接口在这里。**仅国内版有**。
 OAUTH2 = "https://oauth2.account.tencent.com"
 
 #: OneID 在 codebuddy 应用上的 client_id（第 4 步返回的 authorize 里带的）。
@@ -93,7 +107,12 @@ WEB_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 #: 一次登录会话的有效期（秒）。用户在登录页停留超过这个时间就作废重来。
 SESSION_TTL = 900
 #: 允许跳转的上游域（跟随重定向时的白名单，防止被引到站外）。
-_ALLOWED_HOSTS = ("workbuddy.cn", "codebuddy.cn", "tencent.com")
+#:
+#: 这是「跟随重定向」的唯一防线，所以**只加不减**：
+#: 国内版走的 workbuddy.cn / codebuddy.cn / tencent.com 保留，
+#: 国际版补上 workbuddy.ai / codebuddy.ai（登录页与 Keycloak 都在这两个域上）。
+_ALLOWED_HOSTS = ("workbuddy.cn", "codebuddy.cn", "tencent.com",
+                  "workbuddy.ai", "codebuddy.ai")
 #: 单次 HTTP 超时（秒）。
 #:
 #: 分级取值，而不是一个 30s 打天下：登录链路的每一步都是**短小的 API 调用**

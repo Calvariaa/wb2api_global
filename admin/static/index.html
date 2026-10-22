@@ -817,7 +817,7 @@
           <p>登录新账号，或从本机与备份中恢复已有账号。</p>
         </div>
         <div class="intake-actions">
-          <button type="button" onclick="openPhoneLogin()" class="console-btn primary"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg>手机号登录</button>
+          <button type="button" id="intakeLoginBtn" data-login-mode="unknown" onclick="openPhoneLogin()" class="console-btn primary"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg><span id="intakeLoginLabel">手机号登录</span></button>
           <button type="button" onclick="openUpload()" class="console-btn "><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 16v4h16v-4"/></svg>导入账号</button>
           <span class="intake-divider" aria-hidden="true"></span>
           <button type="button" onclick="scanLocal()" class="console-btn quiet"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="13" rx="2"/><path d="M8 21h8m-4-5v5"/></svg>扫描本机</button>
@@ -1769,7 +1769,7 @@ function openModal(html, widthClass) {
   $("#modal").classList.remove("hidden");
   $("#modal").classList.add("flex");
 }
-function closeModal() { window.WBPhone?.closeRegion(); window.WBDateTimePicker?.close(); $("#modal").classList.add("hidden"); $("#modal").classList.remove("flex"); }
+function closeModal() { window.WBPhone?.closeRegion(); window.WBDateTimePicker?.close(); window.closeIntlPoll?.(); $("#modal").classList.add("hidden"); $("#modal").classList.remove("flex"); }
 async function copyText(sel){
   const source = $(sel); if(!source) return;
   const text = source.value ?? source.textContent ?? '';
@@ -1844,6 +1844,9 @@ function enterApp() {
   // 而用户可能根本不打开日志面板 —— 让首屏为它付代价是纯浪费，
   // 改成切到该面板时由 openLogsPanel() 按需加载。
   loadAccounts(); loadKeys(); loadModels(); loadSchedules(); loadSyncConfig(); loadShareInfo();
+  // 登录方式由上游版本决定（国内版=短信 / 国际版=OAuth）。
+  // 放在首屏并行拉，按钮先按短信渲染，拿到结果再原地换掉 —— 不阻塞任何面板。
+  loadEdition();
   // 还原地址栏里的面板（刷新后停在原页面，而不是跳回「账号」首页）。
   // updateUrl:false —— 地址栏本来就是这个值，不必再写一次。
   activateTab(_tabFromUrl(), { updateUrl: false });
@@ -3952,9 +3955,252 @@ async function openPhoneLogin(accountId = null){
   setTimeout(() => { const el = $("#plMobile"); if(el) el.focus(); }, 60);
 }
 
+/* ==========================================================================
+ * 国际版（ADMIN_UPSTREAM_EDITION=intl）浏览器 OAuth 登录
+ *
+ * 与上面手机号登录是**两条互斥的链路**：
+ *   国内版 upstream 用 oneid 短信，国际版用 Keycloak broker（Google/GitHub/X）。
+ *   后端 `/api/login/edition` 是唯一权威：`oneid_login === false` 才走这里。
+ *
+ * 授权必须在**用户自己的浏览器**里完成（Keycloak 会话 + 第三方 OAuth），
+ * 所以流程是：本页 POST start 拿 sid+auth_url → 新标签页打开 →
+ *   本页每 2s 轮询 /intl/poll，后端在拿到回调 code 后换 token 并入库。
+ *
+ * 三个必须处理好的边界：
+ *   1. 弹窗被拦 → 保留 auth_url，给一个可点的链接，不把用户憋死在弹窗上；
+ *   2. 上游闸门满（busy）→ 退避到 4s，而不是原地猛打把闸门压更死；
+ *   3. 关掉弹窗/超时 → 会话还在服务端活着，重开面板能续上（记在 sessionStorage）。
+ * ========================================================================== */
+let _intlSid = "", _intlTimer = null, _intlBusy = false, _intlFail = 0;
+let _intlProviders = null, _intlEdition = null, _intlAnnounced = false;
+
+const INTL_LABELS = { google: "Google", github: "GitHub", twitter: "X (Twitter)",
+                      microsoft: "Microsoft", gitlab: "GitLab", apple: "Apple" };
+const INTL_ICONS = {
+  google:  '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="#4285F4" d="M23 12.3c0-.8-.1-1.6-.2-2.3H12v4.5h6.2a5.3 5.3 0 0 1-2.3 3.5v2.9h3.7c2.2-2 3.4-5 3.4-8.6Z"/><path fill="#34A853" d="M12 23.5c3.1 0 5.7-1 7.6-2.8l-3.7-2.9c-1 .7-2.3 1.1-3.9 1.1-3 0-5.5-2-6.4-4.7H1.8v3A11.5 11.5 0 0 0 12 23.5Z"/><path fill="#FBBC05" d="M5.6 14.2a6.9 6.9 0 0 1 0-4.4v-3H1.8a11.5 11.5 0 0 0 0 10.4l3.8-3Z"/><path fill="#EA4335" d="M12 4.8c1.7 0 3.2.6 4.4 1.7l3.3-3.3A11.5 11.5 0 0 0 1.8 6.8l3.8 3c.9-2.7 3.4-5 6.4-5Z"/></svg>',
+  github:  '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="currentColor"><path d="M12 .5A11.5 11.5 0 0 0 8.4 22.5c.6.1.8-.2.8-.6v-2.2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.1.1 1.7 1.2 1.7 1.2 1 1.7 2.6 1.2 3.2.9.1-.7.4-1.2.7-1.5-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3 0 0 1-.3 3.2 1.2a11 11 0 0 1 5.8 0c2.2-1.5 3.2-1.2 3.2-1.2.6 1.5.2 2.7.1 3a4.4 4.4 0 0 1 1.2 3.1c0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .4.2.7.8.6A11.5 11.5 0 0 0 12 .5Z"/></svg>',
+  twitter: '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true" fill="currentColor"><path d="M18.2 2H21l-6.1 7 7.2 9.6h-5.6l-4.4-5.8-5 5.8H2l6.6-7.6L1.7 2h5.7l4 5.4L18.2 2Zm-1 14.8h1.6L6.9 3.7H5.2l12 13.1Z"/></svg>',
+  microsoft:'<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path fill="#f25022" d="M2 2h9.5v9.5H2z"/><path fill="#7fba00" d="M12.5 2H22v9.5h-9.5z"/><path fill="#00a4ef" d="M2 12.5h9.5V22H2z"/><path fill="#ffb900" d="M12.5 12.5H22V22h-9.5z"/></svg>',
+  default: '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>'
+};
+function intlIcon(id) { return INTL_ICONS[String(id || "").toLowerCase()] || INTL_ICONS.default; }
+function intlLabel(p) { return p.label || INTL_LABELS[String(p.id || "").toLowerCase()] || p.id; }
+
+/** 拉一次版本信息，并把账号池顶部的登录按钮换成对应版本的样子。幂等。 */
+async function loadEdition() {
+  const btn = $("#intakeLoginBtn"), label = $("#intakeLoginLabel");
+  try {
+    const r = await api("/api/login/edition");
+    if (!r.ok) return _intlEdition;
+    _intlEdition = await r.json();
+  } catch (_) { return _intlEdition; }
+  const intl = _intlEdition && _intlEdition.oneid_login === false;
+  if (btn && label) {
+    if (intl) {
+      btn.dataset.loginMode = "intl";
+      btn.setAttribute("onclick", "openIntlLogin()");
+      label.textContent = "OAuth 登录";
+      btn.title = "通过 " + (_intlEdition.oauth_providers || []).map(p => INTL_LABELS[p] || p).join(" / ") + " 授权";
+    } else {
+      btn.dataset.loginMode = "sms";
+      btn.setAttribute("onclick", "openPhoneLogin()");
+      label.textContent = "手机号登录";
+      btn.removeAttribute("title");
+    }
+  }
+  // 国际版下空列表的引导文案单独一句话，别让用户去找根本没有的手机号入口
+  const empty = document.querySelector("#accBody .account-empty");
+  if (empty && intl && !_accData.length) {
+    empty.lastElementChild.textContent = "通过 Google / GitHub 授权登录，或导入已有账号备份即可开始。";
+  }
+  return _intlEdition;
+}
+
+async function intlProviders() {
+  if (_intlProviders && _intlProviders.length) return _intlProviders;
+  try {
+    const r = await api("/api/login/intl/providers");
+    const d = await safeJson(r);
+    if (d.ok && d.data.providers && d.data.providers.length) {
+      _intlProviders = d.data.providers;
+      return _intlProviders;
+    }
+  } catch (_) {}
+  // 上游探测失败也别让按钮消失：退回 /edition 报的 oauth_providers
+  const ids = (_intlEdition && _intlEdition.oauth_providers) || ["google", "github"];
+  _intlProviders = ids.map(p => ({ id: p, label: INTL_LABELS[p] || p }));
+  return _intlProviders;
+}
+
+/** 打开国际版登录面板：一次列出所有身份源，点哪个走哪个。 */
+async function openIntlLogin(accountId = null) {
+  openModal(`
+    <h3 class="font-bold mb-1"><i class="fa-solid fa-shield-halved mr-1 text-emerald-600"></i> OAuth 登录</h3>
+    <p class="text-xs text-slate-500 mb-1">当前上游：国际版 · <code>${esc((_intlEdition && _intlEdition.login_base) || "workbuddy.ai")}</code></p>
+    <p class="text-xs text-slate-500 mb-4" id="intlIntro">选择登录方式，在浏览器完成授权后自动加入账号池；<b>无需安装客户端</b>。</p>
+    <div id="intlProviders" class="intl-providers">
+      <div class="intl-provider is-loading"><i class="fa-solid fa-spinner fa-spin mr-1"></i>正在探测可用身份源…</div>
+    </div>
+    <div id="intlStage" class="hidden">
+      <p class="text-sm mb-2"><i class="fa-solid fa-spinner fa-spin mr-1 text-emerald-600"></i><span id="intlStageText">等待浏览器授权…</span></p>
+      <p class="text-xs text-slate-400 mb-3">授权页没自动打开？<a id="intlAuthLink" href="#" target="_blank" rel="noopener noreferrer">点这里手动打开</a>，完成后本页会自动刷新账号池。</p>
+    </div>
+    <div id="intlDone" class="hidden text-center py-3">
+      <div id="intlDoneIcon" class="text-4xl mb-2"></div>
+      <div id="intlDoneMsg" class="text-sm"></div>
+    </div>
+    <div class="flex justify-end gap-2 mt-4">
+      <button onclick="closeModal()" class="px-3 py-1.5 rounded-lg border text-sm">关闭</button>
+    </div>`, "max-w-md");
+  $('#modal').dataset.closeOnly = '1';
+  const box = $("#intlProviders");
+  const list = await intlProviders();
+  if (!box) return; // 用户已经关掉了
+  box.innerHTML = list.map(p => `
+    <button type="button" class="intl-provider" onclick="intlStart('${esc(p.id)}')">
+      <span class="intl-provider-icon">${intlIcon(p.id)}</span>
+      <span>使用 ${esc(intlLabel(p))} 继续</span>
+    </button>`).join("");
+  // 续上未完成的会话（关过弹窗 / 刷新过页面）
+  const resume = sessionStorage.getItem("wb_intl_sid");
+  if (resume) intlResume(resume);
+}
+
+/** 发起授权：拿 sid + auth_url，新标签页打开，然后开始轮询。 */
+async function intlStart(provider) {
+  if (_intlBusy) return;
+  _intlBusy = true;
+  const box = $("#intlProviders");
+  if (box) box.querySelectorAll("button").forEach(b => b.disabled = true);
+  try {
+    const { ok, data } = await safeJson(await api("/api/login/intl/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider })
+    }));
+    if (!ok) {
+      const detail = data && data.detail;
+      toast((detail && (detail.message || detail)) || "发起授权失败", "err");
+      if (box) box.querySelectorAll("button").forEach(b => b.disabled = false);
+      return;
+    }
+    _intlSid = data.sid;
+    _intlFail = 0;
+    sessionStorage.setItem("wb_intl_sid", _intlSid);
+    sessionStorage.setItem("wb_intl_provider", provider);
+    intlShowStage(data.auth_url, intlLabel({ id: provider }));
+    // 新标签页而不是弹窗：第三方 OAuth 跳转在弹窗里更容易被拦。
+    // 注意 auth_url 现在是**身份源自己的授权页**（accounts.google.com / github.com），
+    // 不是 Keycloak 的 broker 链接 —— broker 链接只认服务端的 AUTH_SESSION_ID
+    // cookie，直接给浏览器会得到 400 "Cookie not found"。服务端已经替它走完那一步。
+    const w = window.open(data.auth_url, "_blank", "noopener");
+    if (!w) toast("浏览器拦截了新标签页，请点上方面板里的链接", "err");
+    intlPollLoop();
+  } catch (e) {
+    toast(e.message || "发起授权失败", "err");
+    if (box) box.querySelectorAll("button").forEach(b => b.disabled = false);
+  } finally { _intlBusy = false; }
+}
+
+function intlShowStage(authUrl, providerLabel) {
+  const stage = $("#intlStage"), box = $("#intlProviders"), intro = $("#intlIntro");
+  if (box) box.classList.add("hidden");
+  if (intro) intro.classList.add("hidden");
+  if (stage) stage.classList.remove("hidden");
+  const link = $("#intlAuthLink");
+  if (link && authUrl) link.href = authUrl;
+  const t = $("#intlStageText");
+  if (t) t.textContent = "等待 " + (providerLabel || "OAuth") + " 授权…（完成后自动入库）";
+}
+
+function intlStopPoll() { clearTimeout(_intlTimer); _intlTimer = null; }
+// closeModal 在脚本顶部定义，早于这里 —— 用 window 上挂一个钩子，避免改动它的调用位置
+window.closeIntlPoll = function () { if (_intlSid) intlStopPoll(); };
+function intlPollLoop() {
+  intlStopPoll();
+  _intlTimer = setTimeout(intlPoll, 2000);
+}
+async function intlPoll() {
+  if (!_intlSid) return;
+  const modalOpen = $("#modal") && !$("#modal").classList.contains("hidden");
+  if (!modalOpen) { // 用户关掉了面板：留 sid 供下次续上，但别在后台空转
+    intlStopPoll(); return;
+  }
+  let delay = 2000;
+  try {
+    const { ok, data } = await safeJson(await api("/api/login/intl/poll", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sid: _intlSid })
+    }));
+    if (!ok) {
+      const detail = data && data.detail;
+      const msg = (detail && (detail.message || detail)) || "轮询失败";
+      // 会话过期/不存在是终态，不要无限重试
+      if (data && detail && ["state_dead", "sid"].includes(detail.step)) {
+        sessionStorage.removeItem("wb_intl_sid");
+        _intlSid = ""; intlFail("授权会话已失效，请重新发起登录");
+        return;
+      }
+      if (++_intlFail >= 3) { intlFail(msg); return; }
+      delay = 4000;
+    } else if (data.done) {
+      sessionStorage.removeItem("wb_intl_sid");
+      sessionStorage.removeItem("wb_intl_provider");
+      _intlSid = ""; _intlFail = 0;
+      intlSuccess(data);
+      return;
+    } else {
+      _intlFail = 0;
+      if (data.busy) delay = 4000; // 上游闸门满：退避，别把闸门压得更死
+    }
+  } catch (_) {
+    if (++_intlFail >= 3) { intlFail("与本地服务的连接中断，请稍后重试"); return; }
+    delay = 4000;
+  }
+  _intlTimer = setTimeout(intlPoll, delay);
+}
+
+function intlSuccess(data) {
+  const stage = $("#intlStage"), done = $("#intlDone");
+  if (stage) stage.classList.add("hidden");
+  if (done) done.classList.remove("hidden");
+  const icon = $("#intlDoneIcon"), msg = $("#intlDoneMsg");
+  if (icon) icon.innerHTML = data.duplicated
+    ? '<i class="fa-solid fa-circle-info text-sky-500"></i>'
+    : '<i class="fa-solid fa-circle-check text-emerald-500"></i>';
+  const live = data.check && data.check.live === false
+    ? `<div class="text-xs text-amber-600 mt-1">凭证已保存，但上游存活校验未通过：${esc((data.check && data.check.live_message) || "")}</div>` : "";
+  const name = (data.account && (data.account.name || data.account.uid)) || data.uid || "";
+  if (msg) msg.innerHTML = `${esc(data.message || "登录成功")}${name ? `<div class="text-xs text-slate-500 mt-1">${esc(name)}</div>` : ""}${live}`;
+  toast(data.message || "登录成功", data.duplicated ? "ok" : "ok");
+  loadAccounts();
+}
+
+function intlFail(message) {
+  intlStopPoll();
+  const stage = $("#intlStage"), done = $("#intlDone");
+  if (stage) stage.classList.add("hidden");
+  if (done) done.classList.remove("hidden");
+  const icon = $("#intlDoneIcon"), msg = $("#intlDoneMsg");
+  if (icon) icon.innerHTML = '<i class="fa-solid fa-circle-xmark text-red-500"></i>';
+  if (msg) msg.innerHTML = `${esc(message)}<div class="mt-2"><button class="console-btn quiet" onclick="openIntlLogin()">重新登录</button></div>`;
+}
+
+/** 面板重开时续上服务端还活着的会话（浏览器已授权但本页没轮完）。 */
+async function intlResume(sid) {
+  try {
+    const r = await api("/api/login/intl/status/" + encodeURIComponent(sid));
+    const st = await safeJson(r);
+    if (!st.ok || !st.data.alive) { sessionStorage.removeItem("wb_intl_sid"); return; }
+    if (st.data.completed) { sessionStorage.removeItem("wb_intl_sid"); return; }
+    _intlSid = sid;
+    const provider = sessionStorage.getItem("wb_intl_provider") || st.data.provider || "";
+    intlShowStage("", intlLabel({ id: provider }));
+    intlPollLoop();
+  } catch (_) { sessionStorage.removeItem("wb_intl_sid"); }
+}
+
 let _joinRefreshPending = false;
-function watchJoinAuthorization(){ _joinRefreshPending = true; }
-function refreshAfterJoin(){
+function watchJoinAuthorization(){ _joinRefreshPending = true; }function refreshAfterJoin(){
   if(!_joinRefreshPending || document.visibilityState === "hidden") return;
   _joinRefreshPending = false;
   loadAccounts();
@@ -4285,9 +4531,14 @@ async function exportAcc(id, name) {
 }
 
 function openReauthAccount(id) {
+  // 重登方式跟着上游版本走：国际版没有手机号通道，只会给 OAuth 入口
+  const intl = _intlEdition && _intlEdition.oneid_login === false;
+  const loginBtn = intl
+    ? `<button class="console-btn mb-3" onclick="openIntlLogin(${Number(id)})">OAuth 授权登录（Google / GitHub）</button>`
+    : `<button class="console-btn mb-3" onclick="openPhoneLogin(${Number(id)})">手机号验证码登录</button>`;
   openModal(`<h3 class="font-bold mb-2">重新登录 · 账号 #${Number(id)}</h3>
     <p class="text-sm mb-4">验证通过后更新原账号凭证，保留排序、Key 绑定与历史记录。模型日限不会因重登而重置。</p>
-    <button class="console-btn mb-3" onclick="openPhoneLogin(${Number(id)})">手机号验证码登录</button>
+    ${loginBtn}
     <label class="block text-sm mb-2">上传凭证或备份文件 <input id="reauthFile" type="file" /></label>
     <p class="text-xs text-slate-500 mb-2">支持新版加密、旧版明文及 .info.bak-时间戳备份；将验证凭证是否仍可用、是否属于原账号。</p>
     <textarea id="reauthJson" class="w-full border rounded-lg p-2 text-xs h-40 font-mono" placeholder="或粘贴最新账号凭证"></textarea>

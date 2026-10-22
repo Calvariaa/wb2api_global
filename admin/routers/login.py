@@ -792,3 +792,177 @@ def join_official_poll(body: OfficialIn, request: Request, db: Session = Depends
         "masked": _mask_name(out["account"].get("name") or out["uid"]),
     }
 
+
+# ===========================================================================
+# 国际版登录：浏览器 OAuth 授权（Google / GitHub）
+# ===========================================================================
+#
+# 为什么单独一组端点，而不是复用上面的 official/*
+# -------------------------------------------------
+# 协议其实**一样**（都是 POST auth/state → 用户浏览器授权 → 轮询 auth/token），
+# 但国际版有三个差异必须体现在接口形状上：
+#
+#   1. 用户在登录页只能选 Google / GitHub，没有手机号这一档 ——
+#      前端需要先知道「有哪些身份源」，所以要一个 providers 探测端点；
+#   2. 需要能直接跳到某个身份源（省掉用户再点一次按钮）；
+#   3. 轮询可能长时间返回「还没登录完」，前端要能区分
+#      「等用户操作」和「这次请求因为闸门满了没打上游」。
+#
+# 复用点：换到 token 之后的**入库判定完全走 `_store_verified_credential`** ——
+# 结构校验 + 上游存活校验 + uid 去重，与国内版一字不差。绝不为国际版放宽。
+
+class IntlStartIn(BaseModel):
+    provider: str = ""
+
+
+@router.get("/intl/providers")
+def intl_providers(_: bool = Depends(require_admin)):
+    """列出国际版可用身份源（Google / GitHub / X）。
+
+    实探测上游：拿 Keycloak 登录页解析 broker 链接。
+    上游不可达时退回内置列表（前端的按钮不至于整个消失）。
+    """
+    from admin import edition, wb_login_intl
+    prof = edition.profile("intl")
+    try:
+        with _upstream_slot("intl_providers"):
+            providers = wb_login_intl.list_providers()
+    except wb_login_intl.WbIntlLoginError as e:
+        _logger.warning("intl providers 探测失败，回退内置列表：%s", e.message)
+        providers = []
+    if not providers:
+        providers = [{"id": p, "label": p.title(), "primary": p in ("google", "github")}
+                     for p in prof.oauth_providers]
+    return {"edition": prof.name, "login_base": prof.login_base, "providers": providers}
+
+
+@router.post("/intl/start")
+def intl_login_start(body: IntlStartIn, _: bool = Depends(require_admin)):
+    """发起国际版浏览器授权：返回 sid + auth_url。
+
+    调用方应把 `auth_url` 交给用户的浏览器打开（新标签页即可）。
+
+    **必须指定 provider**：只有直连 Google / GitHub 的地址才能把「设备 state」
+    带进回跳（见 `wb_login_intl._state_return_url` 的说明）。让用户自己在
+    Keycloak 页面上选身份源的话，回跳是官方默认值，state 会丢、绑定不会完成。
+    所以这里把空 provider 直接拒掉，而不是给一个「能登进去但收不到 token」的地址。
+    """
+    from admin import edition, wb_login_intl
+    if not (body.provider or "").strip():
+        raise HTTPException(400, detail={
+            "message": "请先选择登录方式（Google / GitHub）", "step": "provider"})
+    if not edition.is_intl():
+        # 明确提示，而不是让用户对着 404 猜：国际版端点要求切 edition
+        raise HTTPException(400, detail={
+            "message": "当前上游是国内版（ADMIN_UPSTREAM_EDITION=cn）；"
+                       "国际版登录需设 ADMIN_UPSTREAM_EDITION=intl 后重启",
+            "step": "edition"})
+    wb_login_intl.start_gc_thread()
+    try:
+        with _upstream_slot("intl_start"):
+            sess = wb_login_intl.start_login(body.provider)
+    except wb_login_intl.WbIntlLoginError as e:
+        raise HTTPException(502 if e.step not in ("provider", "busy") else 400,
+                            detail={"message": e.message, "step": e.step}) from None
+    return {
+        "sid": sess.sid,
+        "auth_url": sess.auth_url,
+        "state": sess.state,
+        "provider": sess.provider,
+        "expires_in": wb_login_intl.SESSION_TTL,
+    }
+
+
+class IntlPollIn(BaseModel):
+    sid: str
+
+
+@router.post("/intl/poll")
+def intl_login_poll(body: IntlPollIn, _: bool = Depends(require_admin),
+                    db: Session = Depends(get_db)):
+    """轮询国际版登录结果；完成后换凭证并入库。
+
+    返回：
+      * `{"done": false}`            用户还没登录完（或本次没打上游），继续轮询
+      * `{"done": false, "busy":1}`  上游闸门满，前端退避后再来
+      * `{"done": true, ...}`        已换到凭证并通过双重校验、已入库
+    """
+    from admin import wb_login_intl
+    try:
+        sess = wb_login_intl.get_session(body.sid)
+    except wb_login_intl.WbIntlLoginError as e:
+        raise HTTPException(502, detail={"message": e.message, "step": e.step}) from None
+
+    with sess.lock:
+        if sess.result_cache is not None:
+            cached = sess.result_cache
+            return {"done": True, "duplicated": cached.get("duplicated", False),
+                    "message": cached.get("message", "登录成功"),
+                    "uid": cached.get("uid"),
+                    "account": cached.get("account")}
+
+        try:
+            with _upstream_slot("intl_poll"):
+                result = wb_login_intl.finish(sess)
+        except HTTPException as he:
+            if he.status_code == 503:
+                return {"done": False, "busy": True}
+            raise
+        except wb_login_intl.WbIntlLoginError as e:
+            if e.step == "pending":
+                return {"done": False}
+            code = 502 if e.step in ("upstream", "auth_token", "state_dead") else 400
+            raise HTTPException(code, detail={"message": e.message, "step": e.step}) from None
+
+        # 双重校验 + 去重入库：与国内版**完全同一条**路径。
+        out = _store_verified_credential(result["credential"], result["meta"] or {}, db)
+        sess.result_cache = dict(out)
+
+    return {
+        "done": True,
+        "duplicated": out["duplicated"],
+        "message": out["message"],
+        "uid": out["uid"],
+        "check": {"live": out["live_ok"], "live_message": out["live_msg"],
+                  "format": "ok"},
+        "account": out["account"],
+    }
+
+
+@router.get("/intl/status/{sid}")
+def intl_login_status(sid: str, _: bool = Depends(require_admin)):
+    """查询国际版登录会话状态（前端轮询辅助 / 刷新页面后继续）。"""
+    from admin import wb_login_intl
+    try:
+        sess = wb_login_intl.get_session(sid)
+    except wb_login_intl.WbIntlLoginError:
+        return {"alive": False}
+    return {
+        "alive": True,
+        "provider": sess.provider,
+        "completed": sess.consumed,
+        "age": int(time.time() - sess.created),
+    }
+
+
+@router.get("/edition")
+def upstream_edition(_: bool = Depends(require_admin)):
+    """当前上游版本信息（管理台用来决定登录方式：短信 / OAuth）。"""
+    from admin import edition
+    p = edition.profile()
+    return {
+        "edition": p.name,
+        "label": p.label,
+        "login_base": p.login_base,
+        "chat_base": p.chat_base,
+        "billing_base": p.billing_base,
+        "default_domain": p.default_domain,
+        "oneid_login": p.oneid_login,
+        "oauth_providers": list(p.oauth_providers),
+        "available": [
+            {"edition": name, "label": prof.label,
+             "login_mode": "oauth" if not prof.oneid_login else "sms"}
+            for name, prof in edition.all_profiles().items()
+        ],
+    }
+

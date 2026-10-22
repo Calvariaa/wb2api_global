@@ -127,8 +127,14 @@ from anthropic_adapter import (
 # 常量
 # ---------------------------------------------------------------------------
 
-BACKEND = "https://copilot.tencent.com"
-DEFAULT_DOMAIN = "www.codebuddy.cn"
+#: 模型请求域与默认 domain 随**上游版本**变化（见 `admin/edition.py`）：
+#:   国内版 chat = copilot.tencent.com，domain = www.codebuddy.cn
+#:   国际版 chat = www.workbuddy.ai（与登录/计费同域），domain = www.workbuddy.ai
+from admin import edition  # noqa: E402  上游版本常量（零依赖，import 期安全）
+
+_EDITION = edition.profile()
+BACKEND = _EDITION.chat_base
+DEFAULT_DOMAIN = _EDITION.default_domain
 #: 出站 User-Agent：**必须**伪装成官方客户端。
 #: 原来这里是 `codebuddy2openai/2.0` —— 一个自报家门的网关标识，上游「使用端」
 #: 列会直接显示它，等于对风控举手。（官方无任何 UA 随机化，故这里保持确定性。）

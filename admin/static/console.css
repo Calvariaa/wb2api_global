@@ -47,6 +47,19 @@ button:focus-visible, summary:focus-visible { outline:2px solid var(--brand-ink)
 .intake-copy p { font-size:12px; color:var(--fg-muted); margin:5px 0 0; line-height:1.6; }
 .intake-actions { display:flex; align-items:center; flex-wrap:wrap; gap:6px; }
 .intake-divider { width:1px; height:22px; background:var(--border); margin:0 6px; }
+
+/* 国际版 OAuth 登录面板：身份源按钮列成一列，每个都带品牌图标 */
+.intl-providers { display:flex; flex-direction:column; gap:8px; }
+.intl-provider {
+  display:flex; align-items:center; gap:11px; width:100%; height:42px; padding:0 14px;
+  border:1px solid var(--border); border-radius:9px; background:var(--surface);
+  font-size:13.5px; color:var(--fg); cursor:pointer; text-align:left; transition:background .12s, border-color .12s;
+}
+.intl-provider:hover:not(:disabled) { background:var(--surface-2); border-color:var(--fg-subtle); }
+.intl-provider:disabled { opacity:.55; cursor:default; }
+.intl-provider.is-loading { justify-content:center; color:var(--fg-muted); font-size:12.5px; cursor:default; }
+.intl-provider-icon { display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; flex:0 0 20px; color:var(--fg); }
+:root[data-theme="dark"] .intl-provider-icon svg[fill="currentColor"] { color:#e5e7eb; }
 .account-toolbar { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:14px; margin-bottom:14px; }
 .account-filters { display:flex; align-items:center; padding:3px; border-radius:8px; background:var(--surface-2); gap:2px; }
 .account-filters button { display:flex; align-items:center; gap:7px; border:0; padding:6px 12px; border-radius:6px; font-size:12px; color:var(--fg-muted); background:transparent; cursor:pointer; white-space:nowrap; }
